@@ -89,15 +89,30 @@ class VisualizerAgent(BaseAgent):
             # }
 
         else:
-            self.model_name = self.exp_config.image_gen_model_name
-            self.system_prompt = DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT
-            self.process_executor = None  # Not needed for diagrams
-            self.task_config = {
-                "task_name": "diagram",
-                "use_image_generation": True,  # Use direct image generation
-                "prompt_template": "Render an image based on the following detailed description: {desc}\n Note that do not include figure titles in the image. Diagram: ",
-                "max_output_tokens": 50000,
-            }
+            has_native_image_gen = (
+                generation_utils.gemini_client is not None
+                or generation_utils.openrouter_client is not None
+            )
+            if has_native_image_gen:
+                self.model_name = self.exp_config.image_gen_model_name
+                self.system_prompt = DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT
+                self.process_executor = None
+                self.task_config = {
+                    "task_name": "diagram",
+                    "use_image_generation": True,
+                    "prompt_template": "Render an image based on the following detailed description: {desc}\n Note that do not include figure titles in the image. Diagram: ",
+                    "max_output_tokens": 50000,
+                }
+            else:
+                self.model_name = self.exp_config.image_gen_model_name
+                self.system_prompt = DIAGRAM_CODE_GEN_SYSTEM_PROMPT
+                self.process_executor = ProcessPoolExecutor(max_workers=32)
+                self.task_config = {
+                    "task_name": "diagram",
+                    "use_image_generation": False,
+                    "prompt_template": "Use python matplotlib to generate a scientific diagram based on the following detailed description: {desc}\n Do not include figure titles. Only provide the code without any explanations. Code:",
+                    "max_output_tokens": 50000,
+                }
 
     def __del__(self):
         if self.process_executor:
@@ -184,6 +199,19 @@ class VisualizerAgent(BaseAgent):
                         max_attempts=5,
                         retry_delay=30,
                     )
+                elif generation_utils.openai_client is not None:
+                    # OpenAI-compatible proxy image generation
+                    image_config = {
+                        "system_prompt": self.system_prompt,
+                        "temperature": self.exp_config.temperature,
+                    }
+                    response_list = await generation_utils.call_openai_chat_image_generation_with_retry_async(
+                        model_name=self.model_name,
+                        contents=content_list,
+                        config=image_config,
+                        max_attempts=5,
+                        retry_delay=30,
+                    )
                 else:
                     # Gemini direct image generation
                     gen_config_args["response_modalities"] = ["IMAGE"]
@@ -241,6 +269,13 @@ class VisualizerAgent(BaseAgent):
 
 
 DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT = """You are an expert scientific diagram illustrator. Generate high-quality scientific diagrams based on user requests."""
+
+DIAGRAM_CODE_GEN_SYSTEM_PROMPT = """You are an expert scientific diagram illustrator who writes Python matplotlib code. Given a description of an academic diagram, write Python code using matplotlib, matplotlib.patches, matplotlib.lines, and related libraries to render the diagram programmatically. The code must:
+1. Use plt.figure() with a large figsize (e.g. 16x9 or 20x12) and high DPI
+2. Create clean, publication-quality vector-style diagrams with boxes, arrows, and labels
+3. Use a professional color palette suitable for academic papers
+4. Not include plt.show() — only create the figure
+5. Only output the Python code block, no explanations"""
 
 PLOT_VISUALIZER_AGENT_SYSTEM_PROMPT = """You are an expert statistical plot illustrator. Write code to generate high-quality statistical plots based on user requests."""
 

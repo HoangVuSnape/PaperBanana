@@ -89,8 +89,12 @@ def reinitialize_clients():
 
     key = get_config_val("api_keys", "openai_api_key", "OPENAI_API_KEY", "")
     if key:
-        openai_client = AsyncOpenAI(api_key=key)
-        print("Initialized OpenAI Client with API Key")
+        base_url = get_config_val("api_keys", "openai_base_url", "OPENAI_BASE_URL", "")
+        kwargs = {"api_key": key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        openai_client = AsyncOpenAI(**kwargs)
+        print(f"Initialized OpenAI Client with API Key" + (f" (base_url={base_url})" if base_url else ""))
         initialized.append("OpenAI")
     else:
         openai_client = None
@@ -509,6 +513,103 @@ async def call_openai_image_generation_with_retry_async(
                 await asyncio.sleep(retry_delay)
             else:
                 print(f"Error: All {max_attempts} attempts failed{context_msg}")
+                return ["Error"]
+
+    return ["Error"]
+
+
+async def call_openai_chat_image_generation_with_retry_async(
+    model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
+):
+    """
+    ASYNC: Generate images via an OpenAI-compatible chat completions endpoint
+    that supports modalities=["image","text"] (e.g. Gemini proxies).
+    """
+    if openai_client is None:
+        raise RuntimeError("OpenAI client was not initialized.")
+
+    system_prompt = config.get("system_prompt", "")
+    temperature = config.get("temperature", 1.0)
+
+    openai_contents = _convert_to_openai_format(contents)
+
+    for attempt in range(max_attempts):
+        try:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": openai_contents},
+                ],
+                "temperature": temperature,
+                "max_tokens": 4096,
+            }
+
+            base_url = openai_client.base_url
+            url = f"{str(base_url).rstrip('/')}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {openai_client.api_key}",
+                "Content-Type": "application/json",
+            }
+
+            async with httpx.AsyncClient(timeout=300) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+            choices = data.get("choices", [])
+            if not choices:
+                print(f"[Warning]: OpenAI proxy image gen returned no choices, retrying...")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(retry_delay)
+                continue
+
+            message = choices[0].get("message", {})
+
+            # Try inline_data format (Gemini-style proxy)
+            content = message.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        if "inline_data" in part:
+                            b64_data = part["inline_data"].get("data", "")
+                            if b64_data:
+                                return [b64_data]
+                        if part.get("type") == "image_url":
+                            data_url = part.get("image_url", {}).get("url", "")
+                            if "," in data_url:
+                                return [data_url.split(",", 1)[1]]
+
+            # Try images field
+            images = message.get("images")
+            if images and len(images) > 0:
+                img_item = images[0]
+                if isinstance(img_item, dict):
+                    data_url = img_item.get("image_url", {}).get("url", "")
+                else:
+                    data_url = str(img_item)
+                if "," in data_url:
+                    return [data_url.split(",", 1)[1]]
+                elif data_url:
+                    return [data_url]
+
+            # Try base64 data URL in text content
+            if isinstance(content, str) and content.startswith("data:image"):
+                if "," in content:
+                    return [content.split(",", 1)[1]]
+
+            # If content is plain text, it may not have generated an image
+            print(f"[Warning]: Proxy returned text but no image. Retrying...")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(retry_delay)
+
+        except Exception as e:
+            context_msg = f" for {error_context}" if error_context else ""
+            current_delay = min(retry_delay * (2 ** attempt), 60)
+            print(f"OpenAI proxy image gen attempt {attempt + 1} failed{context_msg}: {e}. Retrying in {current_delay}s...")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(current_delay)
+            else:
                 return ["Error"]
 
     return ["Error"]
